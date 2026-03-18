@@ -50,6 +50,13 @@ class Settings(BaseSettings):
     RAG_RETRIEVAL_K: int = 6
     RAG_MULTIQUERY_COUNT: int = 3
 
+    MILVUS_URI: str = "tcp://localhost:19530"     # Milvus default server URI
+    MILVUS_ALIAS: str = "default"
+    MILVUS_TOKEN: str = ""                  # only needed for Zilliz Cloud
+    MILVUS_COLLECTION: str = "rag_documents"
+    MILVUS_INDEX_TYPE: str = "HNSW"         # best recall for local Milvus
+    MILVUS_METRIC_TYPE: str = "COSINE"      # bge-m3 uses cosine similarity
+
     @field_validator("ALLOWED_ORIGINS", mode="before")
     @classmethod
     def parse_allowed_origins(cls, v):

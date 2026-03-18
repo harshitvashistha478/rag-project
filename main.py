@@ -5,7 +5,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "src.app:app",
         host="localhost",
-        port=8005,
+        port=8009,
         reload=settings.DEBUG,
         workers=1 if settings.DEBUG else 4,
         log_level="debug" if settings.DEBUG else "info",
