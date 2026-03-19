@@ -22,7 +22,7 @@ import numpy as np
 from typing import List, Optional, Tuple
 
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 from src.config import settings
 from src.schemas.rag import (
@@ -261,28 +261,40 @@ def _parse_page_number(text: str) -> int:
 
 # ─── Query ────────────────────────────────────────────────────────────────────
 
+# A single turn in the conversation history passed in from the route layer.
+# role = 'user' | 'assistant',  content = plain text
+HistoryTurn = dict   # {"role": str, "content": str}
+
+
 def query_documents(
     question:     str,
     user_id:      str,
     document_ids: Optional[List[str]],
     config:       RAGConfig,
     max_tokens:   int = 2048,
+    history:      Optional[List[HistoryTurn]] = None,
 ) -> QueryResponse:
     """
-    Query the RAG system.
+    Query the RAG system, optionally with prior conversation history.
 
     Steps
     -----
     1. Embed the question (dense + sparse if bge-m3 and hybrid/sparse).
     2. Retrieve top-k chunks via configured strategy.
     3. Parent-child: replace child content with parent content for richer context.
-    4. Build a structured prompt and call Gemini.
+    4. Build a structured prompt with optional history and call Gemini.
+
+    Args
+    ----
+    history:  List of previous turns in chronological order.
+              Each dict must have ``role`` ('user'|'assistant') and ``content``.
+              The last N_HISTORY_TURNS are used to avoid exceeding the context window.
 
     Returns
     -------
     QueryResponse with answer, sources, and metadata.
     """
-    embedder = get_embedder(config.embedding_model, settings.EMBEDDING_DEVICE)
+    embedder  = get_embedder(config.embedding_model, settings.EMBEDDING_DEVICE)
     is_bge_m3 = isinstance(embedder, BGEM3Embedder)
 
     # ── Embed question ────────────────────────────────────────────
@@ -341,7 +353,7 @@ def query_documents(
         ))
 
     # ── Generate answer ───────────────────────────────────────────
-    answer = _generate_answer(question, sources, max_tokens)
+    answer = _generate_answer(question, sources, max_tokens, history=history or [])
 
     return QueryResponse(
         answer=answer,
@@ -380,27 +392,24 @@ def _expand_to_parents(hits: List[dict]) -> List[dict]:
 
 # ─── LLM generation ───────────────────────────────────────────────────────────
 
-_SYSTEM_PROMPT = """You are a precise document assistant.
-Answer the user's question using ONLY the provided context.
+_SYSTEM_PROMPT = """You are a precise document assistant with memory of the ongoing conversation.
+Answer the user's question using ONLY the provided context documents.
 If the context does not contain enough information, say so clearly.
 Cite sources using [Source N] notation when referencing specific facts.
-If a context block contains a table, refer to it accurately."""
+If a context block contains a table, refer to it accurately.
+Use the conversation history to resolve pronouns, follow-up questions, and references to earlier answers."""
+
+# Max prior turns to include in the prompt (each turn = 1 user + 1 assistant message).
+# Keeping this bounded prevents the prompt from exceeding Gemini's context window.
+N_HISTORY_TURNS = 6
 
 
 def _build_llm(max_tokens: int) -> ChatGoogleGenerativeAI:
-    """
-    Construct a LangChain ChatGoogleGenerativeAI instance.
-
-    The model is intentionally NOT cached as a module-level singleton because
-    ``max_tokens`` varies per call.  ChatGoogleGenerativeAI is lightweight to
-    instantiate — no model weights are loaded locally.
-    """
     return ChatGoogleGenerativeAI(
         model=settings.GEMINI_CHAT_MODEL,
         google_api_key=settings.GOOGLE_API_KEY,
         temperature=settings.GEMINI_TEMPERATURE,
         max_output_tokens=max_tokens,
-        # Convert system messages automatically for Gemini's API format
         convert_system_message_to_human=False,
     )
 
@@ -409,18 +418,23 @@ def _generate_answer(
     question:   str,
     sources:    List[SourceChunk],
     max_tokens: int = 2048,
+    history:    Optional[List[HistoryTurn]] = None,
 ) -> str:
     """
-    Build a structured prompt from retrieved chunks and call Gemini via LangChain.
+    Build a multi-turn prompt and call Gemini via LangChain.
 
     Message layout
     ──────────────
-    SystemMessage  — role instructions and citation rules
-    HumanMessage   — context blocks + question (single turn; no chat history)
+    SystemMessage          — role + citation rules
+    HumanMessage           — retrieved context (always injected on EVERY turn so the
+                             model always has the freshest relevant chunks)
+    [AIMessage / HumanMessage] * N  — last N_HISTORY_TURNS from conversation history
+    HumanMessage           — current question
 
-    Using a two-message structure rather than a single concatenated string lets
-    LangChain correctly map to Gemini's ``system_instruction`` + ``user`` turn,
-    which gives the model a cleaner signal about which part is instruction vs data.
+    Injecting the context on every turn (rather than only the first) ensures the
+    model can cite sources even when answering follow-up questions.  The history
+    gives it the conversational thread to resolve references like "what about that
+    table?" or "expand on the second point".
     """
     if not sources:
         return (
@@ -428,7 +442,7 @@ def _generate_answer(
             "to answer your question."
         )
 
-    # ── Build numbered context blocks ─────────────────────────────
+    # ── Build numbered context block ──────────────────────────────
     context_blocks = []
     for i, src in enumerate(sources, start=1):
         page_label = f"Page {src.page_number}" if src.page_number else "Page N/A"
@@ -438,15 +452,35 @@ def _generate_answer(
         )
     context = "\n\n---\n\n".join(context_blocks)
 
-    # ── Compose messages ──────────────────────────────────────────
-    messages = [
-        SystemMessage(content=_SYSTEM_PROMPT),
-        HumanMessage(content=(
-            f"CONTEXT:\n{context}\n\n"
-            f"QUESTION:\n{question}\n\n"
-            f"ANSWER:"
-        )),
-    ]
+    # ── Start building the message list ──────────────────────────
+    messages = [SystemMessage(content=_SYSTEM_PROMPT)]
+
+    # Context is injected as the very first human turn so Gemini treats it as
+    # ground truth for the whole conversation.
+    messages.append(HumanMessage(content=(
+        f"DOCUMENT CONTEXT (use this to answer all questions in this conversation):\n"
+        f"{context}"
+    )))
+    # Gemini requires alternating human/assistant turns — add a minimal ack.
+    messages.append(AIMessage(content=(
+        "Understood. I have read the document context and will answer your questions "
+        "based on it, citing [Source N] where appropriate."
+    )))
+
+    # ── Inject capped conversation history ────────────────────────
+    if history:
+        # Take at most the last N_HISTORY_TURNS complete pairs
+        recent = history[-(N_HISTORY_TURNS * 2):]
+        for turn in recent:
+            role    = turn.get("role", "user")
+            content = turn.get("content", "")
+            if role == "user":
+                messages.append(HumanMessage(content=content))
+            else:
+                messages.append(AIMessage(content=content))
+
+    # ── Current question ──────────────────────────────────────────
+    messages.append(HumanMessage(content=question))
 
     llm      = _build_llm(max_tokens)
     response = llm.invoke(messages)

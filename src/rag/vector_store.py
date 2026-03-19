@@ -44,6 +44,7 @@ from pymilvus import (
     utility,
     AnnSearchRequest,
     RRFRanker,
+    MilvusException
 )
 
 from src.config import settings
@@ -90,14 +91,43 @@ def ensure_collection(name: Optional[str] = None) -> Collection:
     """
     Return the Milvus collection, creating and indexing it if it doesn't exist.
     Safe to call on every request (cheap no-op when collection already exists).
+
+    Self-healing guards:
+      code 700 — collection exists but has no indexes (crashed during creation)
+      code 100 — catalog entry exists but underlying data is gone (storage wipe)
+    Both cases drop the stale entry and fall through to clean creation.
     """
     name = name or settings.MILVUS_COLLECTION
     _connect()
 
     if utility.has_collection(name, using=settings.MILVUS_ALIAS):
         col = Collection(name, using=settings.MILVUS_ALIAS)
-        col.load()
-        return col
+
+        # Guard 1: no indexes → previous creation run crashed before indexing
+        if not col.indexes:
+            logger.warning(
+                f"Collection '{name}' exists but has no indexes — "
+                "dropping and recreating."
+            )
+            utility.drop_collection(name, using=settings.MILVUS_ALIAS)
+            # Fall through to creation block below
+
+        else:
+            try:
+                col.load()
+                return col
+            except MilvusException as e:
+                # Guard 2: catalog entry exists but underlying data is missing
+                # (happens after Milvus storage wipe / Docker volume reset)
+                if e.code in (100, 700):
+                    logger.warning(
+                        f"Collection '{name}' is listed but not loadable "
+                        f"(code={e.code}) — dropping stale entry and recreating."
+                    )
+                    utility.drop_collection(name, using=settings.MILVUS_ALIAS)
+                    # Fall through to creation block below
+                else:
+                    raise
 
     logger.info(f"Creating Milvus collection '{name}' …")
 
@@ -157,42 +187,34 @@ def insert_chunks(
     records:         List[Dict[str, Any]],
     collection_name: Optional[str] = None,
 ) -> int:
-    """
-    Insert a list of chunk records into Milvus.
-
-    Expected keys per record:
-        id, document_id, user_id, content,
-        dense_vector   (np.ndarray shape [1024]),
-        sparse_vector  (Dict[int, float], optional — placeholder used if absent),
-        page_number, chunk_type, parent_id, is_parent, metadata_json
-
-    Returns:
-        Number of records inserted.
-    """
     if not records:
         return 0
 
     col = ensure_collection(collection_name)
 
-    # Build column-oriented data (Milvus bulk insert format)
-    data = {
-        F_ID:         [r[F_ID]                                       for r in records],
-        F_DOC_ID:     [r[F_DOC_ID]                                   for r in records],
-        F_USER_ID:    [r[F_USER_ID]                                  for r in records],
-        F_CONTENT:    [r[F_CONTENT][:MAX_CONTENT]                    for r in records],
-        F_DENSE:      [r[F_DENSE].tolist()                           for r in records],
-        F_SPARSE:     [r.get(F_SPARSE, _SPARSE_PLACEHOLDER)         for r in records],
-        F_PAGE:       [int(r.get(F_PAGE, 0))                        for r in records],
-        F_CHUNK_TYPE: [r.get(F_CHUNK_TYPE, "text")                  for r in records],
-        F_PARENT_ID:  [r.get(F_PARENT_ID, "")                       for r in records],
-        F_IS_PARENT:  [bool(r.get(F_IS_PARENT, False))              for r in records],
-        F_METADATA:   [r.get(F_METADATA, "{}")[:MAX_METADATA]        for r in records],
-    }
+    # Row-oriented format — each dict is one record.
+    # pymilvus 2.4+ accepts List[Dict] directly via insert_rows internally.
+    rows = []
+    for r in records:
+        row = {
+            F_ID:         str(r[F_ID]),
+            F_DOC_ID:     str(r[F_DOC_ID]),
+            F_USER_ID:    str(r[F_USER_ID]),
+            F_CONTENT:    r[F_CONTENT][:MAX_CONTENT],
+            F_DENSE:      r[F_DENSE].tolist(),
+            F_SPARSE:     r.get(F_SPARSE, _SPARSE_PLACEHOLDER),
+            F_PAGE:       int(r.get(F_PAGE, 0)),
+            F_CHUNK_TYPE: r.get(F_CHUNK_TYPE, "text"),
+            F_PARENT_ID:  str(r.get(F_PARENT_ID, "")),
+            F_IS_PARENT:  bool(r.get(F_IS_PARENT, False)),
+            F_METADATA:   r.get(F_METADATA, "{}")[:MAX_METADATA],
+        }
+        rows.append(row)
 
-    col.insert(data)
+    col.insert(rows)
     col.flush()
-    logger.info(f"Inserted {len(records)} records into '{col.name}'.")
-    return len(records)
+    logger.info(f"Inserted {len(rows)} records into '{col.name}'.")
+    return len(rows)
 
 
 def delete_document_chunks(

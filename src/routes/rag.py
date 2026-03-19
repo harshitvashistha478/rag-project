@@ -1,43 +1,64 @@
 """
-RAG API router.
+RAG API router — Celery-backed async ingestion + chat session management.
 
-Endpoints
-─────────
-  POST  /rag/ingest/{document_id}   — chunk + embed + store a document
-  POST  /rag/query                  — query across user's documents
-  GET   /rag/config/defaults        — browsable strategy reference
-  DELETE /rag/document/{document_id} — wipe vectors (keeps S3 / DB record)
+Ingest flow (async)
+───────────────────
+  POST /rag/ingest/{document_id}
+    → validates document
+    → dispatches ingest_document_task to Celery
+    → returns {task_id, document_id, status: "queued"} immediately
+
+  GET  /rag/tasks/{task_id}
+    → polls Celery result backend (Redis) for task state
+    → returns {state, progress, result, error}
+
+All other endpoints (query, sessions, config, vectors) are unchanged.
 """
 
+import json
 import logging
 from uuid import UUID
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
+from celery.result import AsyncResult
 
 from src.database import get_db
 from src.models.document import Document, DocumentStatus
 from src.models.user import User
+from src.models.chat import ChatSession, ChatMessage
 from src.schemas.rag import (
     RAGConfig,
     IngestRequest,
     IngestResponse,
+    TaskStatusResponse,
     QueryRequest,
     QueryResponse,
 )
+from src.schemas.chat import (
+    ChatSessionResponse,
+    ChatSessionDetailResponse,
+    ChatSessionListResponse,
+    ChatMessageResponse,
+    RenameChatSessionRequest,
+)
 from src.utils.auth import get_current_active_user
-from src.rag.pipeline import ingest_document, query_documents
+from src.tasks.rag_tasks import ingest_document_task
+from src.rag.pipeline import query_documents
 from src.rag import vector_store as vs
+from src.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/rag", tags=["RAG"])
 
+N_HISTORY_TURNS = 6
+
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _get_ready_document(document_id: UUID, user: User, db: Session) -> Document:
-    """Fetch a non-deleted document owned by the user, or raise 404."""
     doc = (
         db.query(Document)
         .filter(
@@ -52,39 +73,56 @@ def _get_ready_document(document_id: UUID, user: User, db: Session) -> Document:
     return doc
 
 
-# ─── Ingest ───────────────────────────────────────────────────────────────────
+def _get_session_or_404(session_id: UUID, user_id: UUID, db: Session) -> ChatSession:
+    sess = db.query(ChatSession).filter(
+        ChatSession.id == session_id,
+        ChatSession.user_id == user_id,
+    ).first()
+    if not sess:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat session not found.")
+    return sess
+
+
+def _session_to_response(sess: ChatSession, db: Session) -> ChatSessionResponse:
+    return ChatSessionResponse(
+        id=sess.id,
+        user_id=sess.user_id,
+        title=sess.title,
+        created_at=sess.created_at,
+        updated_at=sess.updated_at,
+        message_count=sess.messages.count(),
+    )
+
+
+# ─── Ingest (async) ───────────────────────────────────────────────────────────
 
 @router.post(
     "/ingest/{document_id}",
-    response_model=IngestResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Ingest a PDF document into the vector store",
+    response_model=TaskStatusResponse,
+    status_code=status.HTTP_202_ACCEPTED,   # 202 = accepted for processing
+    summary="Queue a PDF document for background RAG ingestion",
 )
 def ingest(
-    document_id: UUID,
+    document_id:  UUID,
     body:         IngestRequest         = IngestRequest(),
     current_user: User                  = Depends(get_current_active_user),
     db:           Session               = Depends(get_db),
 ):
     """
-    Parse → chunk → embed → store a document in Milvus.
+    Dispatches a background Celery task to ingest the document.
 
-    The document must already be uploaded (status PENDING or FAILED).
-    Only PDF files are currently supported for RAG ingestion.
+    Returns immediately with a ``task_id``.
+    Poll ``GET /rag/tasks/{task_id}`` to track progress.
 
-    On success, the document status is updated to **READY** and `chunk_count`
-    is populated.  On failure the status is set to **FAILED** with an error
-    message.
+    The document ``status`` field in the Documents API will also reflect
+    the current state (PENDING → PROCESSING → READY | FAILED).
     """
     doc = _get_ready_document(document_id, current_user, db)
 
     if doc.file_extension.lower() != "pdf":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                f"RAG ingestion only supports PDF files. "
-                f"This document has extension '.{doc.file_extension}'."
-            ),
+            detail=f"RAG ingestion only supports PDF files. Extension: '.{doc.file_extension}'.",
         )
 
     if doc.status == DocumentStatus.PROCESSING:
@@ -93,55 +131,97 @@ def ingest(
             detail="Document is already being processed.",
         )
 
-    # Mark as processing immediately
-    doc.status = DocumentStatus.PROCESSING
+    # Mark as PENDING so the UI can show the queued state immediately
+    doc.status = DocumentStatus.PENDING
     db.commit()
 
-    try:
-        chunk_count = ingest_document(
-            document_id=str(doc.id),
-            user_id=str(current_user.id),
-            s3_key=doc.s3_key,
-            original_filename=doc.original_filename,
-            config=body.config,
-        )
+    # Dispatch to Celery — all args must be JSON-serialisable
+    task = ingest_document_task.apply_async(
+        kwargs={
+            "document_id":       str(doc.id),
+            "user_id":           str(current_user.id),
+            "s3_key":            doc.s3_key,
+            "original_filename": doc.original_filename,
+            "config_dict":       body.config.model_dump(),
+        },
+        queue="ingest",
+    )
 
-        doc.status          = DocumentStatus.READY
-        doc.chunk_count     = chunk_count
-        doc.processing_error = None
-        db.commit()
+    logger.info(
+        f"[ingest] Queued task={task.id} "
+        f"document={document_id} user={current_user.email}"
+    )
 
-        logger.info(
-            f"[ingest] document={document_id} user={current_user.email} "
-            f"chunks={chunk_count} model={body.config.embedding_model} "
-            f"strategy={body.config.chunking_strategy}"
-        )
+    return TaskStatusResponse(
+        task_id=task.id,
+        document_id=str(document_id),
+        state="PENDING",
+        message="Document queued for ingestion. Poll /rag/tasks/{task_id} for progress.",
+    )
 
-        return IngestResponse(
-            document_id=str(document_id),
-            chunks_created=chunk_count,
-            embedding_model=body.config.embedding_model,
-            chunking_strategy=body.config.chunking_strategy,
-            status="ready",
-            message=f"Successfully ingested '{doc.original_filename}' — {chunk_count} chunks created.",
-        )
 
-    except HTTPException:
-        # Re-raise S3 / storage errors directly
-        doc.status           = DocumentStatus.FAILED
-        doc.processing_error = "Storage error during ingestion."
-        db.commit()
-        raise
+# ─── Task status polling ──────────────────────────────────────────────────────
 
-    except Exception as exc:
-        doc.status           = DocumentStatus.FAILED
-        doc.processing_error = str(exc)[:500]
-        db.commit()
-        logger.exception(f"[ingest] Failed for document={document_id}: {exc}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Ingestion failed: {exc}",
-        )
+@router.get(
+    "/tasks/{task_id}",
+    response_model=TaskStatusResponse,
+    summary="Poll the status of a background ingestion task",
+)
+def get_task_status(
+    task_id:      str,
+    current_user: User = Depends(get_current_active_user),
+):
+    """
+    Returns the current state of a Celery task.
+
+    States
+    ------
+    PENDING  — queued, not yet started
+    STARTED  — worker picked it up, currently running
+    SUCCESS  — completed successfully
+    FAILURE  — failed after all retries
+    RETRY    — transient error, waiting to retry
+    REVOKED  — cancelled
+
+    The ``result`` field is populated on SUCCESS.
+    The ``error`` field is populated on FAILURE.
+    """
+    result = AsyncResult(task_id, app=celery_app)
+
+    response = TaskStatusResponse(
+        task_id=task_id,
+        document_id=None,
+        state=result.state,
+        message=_state_message(result.state),
+    )
+
+    if result.state == "SUCCESS":
+        data              = result.result or {}
+        response.document_id = data.get("document_id")
+        response.result   = data
+        response.message  = data.get("message", "Ingestion complete.")
+
+    elif result.state == "FAILURE":
+        response.error   = str(result.result)   # result holds the exception on failure
+        response.message = "Ingestion failed."
+
+    elif result.state == "STARTED":
+        # task.info can carry custom progress metadata if we call
+        # self.update_state(state="STARTED", meta={...}) from inside the task
+        response.meta    = result.info if isinstance(result.info, dict) else {}
+
+    return response
+
+
+def _state_message(state: str) -> str:
+    return {
+        "PENDING": "Queued — waiting for an available worker.",
+        "STARTED": "In progress — downloading, parsing, and embedding…",
+        "SUCCESS": "Ingestion complete.",
+        "FAILURE": "Ingestion failed.",
+        "RETRY":   "Transient error — retrying shortly.",
+        "REVOKED": "Task was cancelled.",
+    }.get(state, state)
 
 
 # ─── Query ────────────────────────────────────────────────────────────────────
@@ -149,44 +229,57 @@ def ingest(
 @router.post(
     "/query",
     response_model=QueryResponse,
-    summary="Ask a question over your ingested documents",
+    summary="Ask a question — creates or continues a chat session",
 )
 def query(
     payload:      QueryRequest,
     current_user: User    = Depends(get_current_active_user),
     db:           Session = Depends(get_db),
 ):
-    """
-    Retrieve relevant chunks from the vector store and generate an answer
-    using Gemini.
-
-    If `document_ids` is omitted, the query searches across **all** of the
-    user's READY documents.  Passing a list restricts the search scope.
-
-    The `config` field controls which embedding model, chunking strategy
-    (must match what was used during ingestion), and retrieval strategy to use.
-    """
     if not payload.question.strip():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Question cannot be empty.",
-        )
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
-    # Validate + authorise requested document IDs
-    doc_id_strs: list | None = None
+    doc_id_strs = None
     if payload.document_ids:
         doc_id_strs = []
         for doc_uuid in payload.document_ids:
             doc = _get_ready_document(doc_uuid, current_user, db)
             if doc.status != DocumentStatus.READY:
                 raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=(
-                        f"Document '{doc.original_filename}' is not ready for querying "
-                        f"(status: {doc.status.value}).  Please ingest it first."
-                    ),
+                    status_code=400,
+                    detail=f"Document '{doc.original_filename}' is not ready (status: {doc.status.value}).",
                 )
             doc_id_strs.append(str(doc.id))
+
+    # Resolve or create session
+    if payload.session_id:
+        session = _get_session_or_404(payload.session_id, current_user.id, db)
+    else:
+        title = payload.question.strip()[:80]
+        if len(payload.question.strip()) > 80:
+            title += "…"
+        session = ChatSession(
+            user_id=current_user.id,
+            title=title,
+            rag_config_json=payload.config.model_dump_json(),
+        )
+        db.add(session)
+        db.flush()
+
+    past_messages = session.messages.order_by(ChatMessage.turn_index.asc()).all()
+    history       = [
+        {"role": m.role, "content": m.content}
+        for m in past_messages[-(N_HISTORY_TURNS * 2):]
+    ]
+    turn_index = len(past_messages)
+
+    user_msg = ChatMessage(
+        session_id=session.id,
+        role="user",
+        content=payload.question,
+        turn_index=turn_index,
+    )
+    db.add(user_msg)
 
     try:
         result = query_documents(
@@ -195,83 +288,59 @@ def query(
             document_ids=doc_id_strs,
             config=payload.config,
             max_tokens=payload.max_answer_tokens,
+            history=history,
         )
-
-        if not payload.include_sources:
-            result.sources = None
-
-        return result
-
     except Exception as exc:
+        db.rollback()
         logger.exception(f"[query] Failed for user={current_user.email}: {exc}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Query failed: {exc}",
-        )
+        raise HTTPException(status_code=500, detail=f"Query failed: {exc}")
+
+    sources_json = None
+    if result.sources:
+        sources_json = json.dumps([s.model_dump() for s in result.sources])
+
+    assistant_msg = ChatMessage(
+        session_id=session.id,
+        role="assistant",
+        content=result.answer,
+        sources_json=sources_json,
+        metadata_json=json.dumps({
+            "model_used":         result.model_used,
+            "retrieval_strategy": result.retrieval_strategy,
+            "chunks_retrieved":   result.chunks_retrieved,
+        }),
+        turn_index=turn_index + 1,
+    )
+    db.add(assistant_msg)
+    db.commit()
+
+    if not payload.include_sources:
+        result.sources = None
+
+    result.session_id = str(session.id)
+    return result
 
 
 # ─── Config reference ─────────────────────────────────────────────────────────
 
-@router.get(
-    "/config/defaults",
-    summary="View default RAG configuration and all available options",
-)
+@router.get("/config/defaults")
 def get_default_config():
-    """
-    Returns the default RAGConfig plus human-readable descriptions of every
-    option.  Useful for building a settings UI on the frontend.
-    """
     return {
         "defaults": RAGConfig().model_dump(),
         "options": {
             "chunking_strategies": {
-                "recursive": (
-                    "Splits on paragraph → sentence → word boundaries.  "
-                    "Fast, reliable, no extra compute.  Best default choice."
-                ),
-                "semantic": (
-                    "Embeds every sentence, then splits where cosine distance "
-                    "between adjacent sentences exceeds the threshold.  "
-                    "Produces thematically coherent chunks.  ~2× slower than recursive "
-                    "due to the extra embedding pass."
-                ),
-                "parent_child": (
-                    "Creates large parent chunks (2 k chars) and smaller child chunks "
-                    "(400 chars).  Children are embedded and retrieved; parents are "
-                    "returned to the LLM for richer context.  Best precision + recall "
-                    "trade-off on long, dense documents."
-                ),
+                "recursive":    "Splits on paragraph → sentence → word. Fast, reliable.",
+                "semantic":     "Embedding-guided splits at topic boundaries.",
+                "parent_child": "Small child chunks retrieved, large parent chunks sent to LLM.",
             },
             "embedding_models": {
-                "BAAI/bge-m3": (
-                    "Multilingual (100+ languages).  "
-                    "Produces dense vectors + sparse lexical weights in one pass.  "
-                    "Required for sparse and hybrid retrieval.  "
-                    "~570 M parameters."
-                ),
-                "BAAI/bge-large-en-v1.5": (
-                    "English-only.  Top-tier MTEB dense retrieval score.  "
-                    "Faster inference than bge-m3 with lower memory.  "
-                    "Only supports dense retrieval.  "
-                    "~335 M parameters."
-                ),
+                "BAAI/bge-m3":            "Multilingual. Dense + sparse. Required for hybrid.",
+                "BAAI/bge-large-en-v1.5": "English-only. Fastest dense-only baseline.",
             },
             "retrieval_strategies": {
-                "dense": (
-                    "Approximate nearest-neighbour search on 1024-dim cosine space.  "
-                    "Excellent for paraphrase and conceptual queries.  "
-                    "Works with both embedding models."
-                ),
-                "sparse": (
-                    "Lexical search using SPLADE-style token weights.  "
-                    "Excellent for exact terms, acronyms, product codes, proper nouns.  "
-                    "Requires BAAI/bge-m3."
-                ),
-                "hybrid": (
-                    "Combines dense ANN + sparse search with Reciprocal Rank Fusion (k=60).  "
-                    "Best overall recall across both conceptual and keyword queries.  "
-                    "Requires BAAI/bge-m3."
-                ),
+                "dense":  "ANN vector search. Best for conceptual queries.",
+                "sparse": "Lexical search. Best for exact terms. Requires bge-m3.",
+                "hybrid": "Dense + sparse fused with RRF. Best overall. Requires bge-m3.",
             },
         },
     }
@@ -279,32 +348,72 @@ def get_default_config():
 
 # ─── Delete vectors ───────────────────────────────────────────────────────────
 
-@router.delete(
-    "/document/{document_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-    summary="Remove all vector embeddings for a document",
-)
+@router.delete("/document/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_document_vectors(
     document_id:  UUID,
     current_user: User    = Depends(get_current_active_user),
     db:           Session = Depends(get_db),
 ):
-    """
-    Deletes all Milvus vectors for the document and resets its status to
-    PENDING.  The S3 file and PostgreSQL record are kept intact.
-
-    Use this to force a clean re-ingestion with different settings.
-    """
     doc = _get_ready_document(document_id, current_user, db)
-
     vs.delete_document_chunks(str(document_id))
-
     doc.status      = DocumentStatus.PENDING
     doc.chunk_count = None
     db.commit()
+    return None
 
-    logger.info(
-        f"[vectors] Deleted vectors for document={document_id} "
-        f"user={current_user.email}"
+
+# ─── Chat Session endpoints ───────────────────────────────────────────────────
+
+@router.get("/sessions", response_model=ChatSessionListResponse)
+def list_sessions(
+    page:         int     = Query(1, ge=1),
+    page_size:    int     = Query(20, ge=1, le=100),
+    current_user: User    = Depends(get_current_active_user),
+    db:           Session = Depends(get_db),
+):
+    q       = db.query(ChatSession).filter(ChatSession.user_id == current_user.id).order_by(ChatSession.updated_at.desc())
+    total   = q.count()
+    sessions = q.offset((page - 1) * page_size).limit(page_size).all()
+    return ChatSessionListResponse(items=[_session_to_response(s, db) for s in sessions], total=total)
+
+
+@router.get("/sessions/{session_id}", response_model=ChatSessionDetailResponse)
+def get_session(
+    session_id:   UUID,
+    current_user: User    = Depends(get_current_active_user),
+    db:           Session = Depends(get_db),
+):
+    session  = _get_session_or_404(session_id, current_user.id, db)
+    messages = session.messages.order_by(ChatMessage.turn_index.asc()).all()
+    return ChatSessionDetailResponse(
+        id=session.id, user_id=session.user_id, title=session.title,
+        created_at=session.created_at, updated_at=session.updated_at,
+        message_count=len(messages),
+        messages=[ChatMessageResponse.from_orm_with_json(m) for m in messages],
     )
+
+
+@router.patch("/sessions/{session_id}", response_model=ChatSessionResponse)
+def rename_session(
+    session_id:   UUID,
+    payload:      RenameChatSessionRequest,
+    current_user: User    = Depends(get_current_active_user),
+    db:           Session = Depends(get_db),
+):
+    session       = _get_session_or_404(session_id, current_user.id, db)
+    session.title = payload.title[:100]
+    db.commit()
+    db.refresh(session)
+    return _session_to_response(session, db)
+
+
+@router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_session(
+    session_id:   UUID,
+    current_user: User    = Depends(get_current_active_user),
+    db:           Session = Depends(get_db),
+):
+    session = _get_session_or_404(session_id, current_user.id, db)
+    db.delete(session)
+    db.commit()
     return None

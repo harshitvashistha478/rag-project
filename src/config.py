@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     RAG_RETRIEVAL_K: int = 6
     RAG_MULTIQUERY_COUNT: int = 3
 
+    REDIS_URL: str = "redis://localhost:6379/0"
+
     MILVUS_URI: str = "tcp://localhost:19530"     # Milvus default server URI
     MILVUS_ALIAS: str = "default"
     MILVUS_TOKEN: str = ""                  # only needed for Zilliz Cloud

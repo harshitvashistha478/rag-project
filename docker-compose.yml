@@ -1,0 +1,77 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# DocMind — Docker Compose
+#
+# Services
+# ────────
+#   redis       — Celery broker + result backend
+#   worker      — Celery ingest worker (scale with: docker compose up --scale worker=3)
+#   flower      — Celery task monitor UI  (http://localhost:5555)
+#
+# FastAPI and Milvus are run separately (FastAPI via uvicorn locally,
+# Milvus via its own docker-compose or standalone binary).
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: docmind_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes   # persist tasks across restarts
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Celery ingest worker ───────────────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: docmind_worker
+    restart: unless-stopped
+    command: >
+      celery -A src.celery_app.celery_app worker
+        --loglevel=info
+        --queues=ingest,default
+        --concurrency=2
+        --hostname=worker@%h
+    env_file:
+      - ./.env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app   # hot-reload code changes without rebuilding
+    working_dir: /app
+
+  # ── Flower — task monitoring UI ────────────────────────────────────────────
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: docmind_flower
+    restart: unless-stopped
+    command: >
+      celery -A src.celery_app.celery_app flower
+        --port=5555
+        --broker=redis://redis:6379/0
+    ports:
+      - "5555:5555"
+    env_file:
+      - ./.env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+
+volumes:
+  redis_data:
